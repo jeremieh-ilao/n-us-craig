@@ -11,13 +11,11 @@ export async function checkInternalSecret(
     return reply.status(401).send({ error: 'Unauthorized' });
   }
 
-  const expectedBuffer = Buffer.from(secret);
-  const actualBuffer = Buffer.from(header);
+  const hmacKey = 'n-us-internal-auth';
+  const expectedHmac = crypto.createHmac('sha256', hmacKey).update(secret).digest();
+  const actualHmac = crypto.createHmac('sha256', hmacKey).update(header).digest();
 
-  if (
-    expectedBuffer.length !== actualBuffer.length ||
-    !crypto.timingSafeEqual(expectedBuffer, actualBuffer)
-  ) {
+  if (!crypto.timingSafeEqual(expectedHmac, actualHmac)) {
     return reply.status(401).send({ error: 'Unauthorized' });
   }
 }
