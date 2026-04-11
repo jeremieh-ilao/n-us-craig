@@ -280,3 +280,38 @@ nvm use node
 #### Kill all processes
 
 `pm2 stop all`
+
+## n=us Fork: Internal API
+
+This fork includes an internal HTTP API to control the bot externally.
+
+### Configuration
+
+Add the following to your `apps/bot/config/_default.js` (already included in this fork):
+
+```javascript
+internalApi: {
+  enabled: true,
+  port: 7890,
+  host: '127.0.0.1',
+  secretEnv: 'N_US_INTERNAL_API_SECRET',
+  webhookUrlEnv: 'N_US_WEBHOOK_URL'
+}
+```
+
+### Endpoints
+
+All endpoints (except `/internal/health`) require the `X-Internal-Secret` header matching the `N_US_INTERNAL_API_SECRET` environment variable.
+
+- `GET /internal/health`: Health check (no auth).
+- `POST /internal/record/start`: Start recording.
+  - Body: `{ sessionId, guildId, channelId, initiatorUserId }`
+- `POST /internal/record/stop`: Stop recording and trigger webhook.
+  - Body: `{ sessionId }`
+- `GET /internal/record/:recordingId/file`: Download OGG file.
+  - Query: `?download=1` for attachment.
+
+### Webhook
+
+When a recording is stopped, a POST request is sent to `N_US_WEBHOOK_URL` with:
+`{ sessionId, recordingId, endedAt, durationMs, fileSize }`

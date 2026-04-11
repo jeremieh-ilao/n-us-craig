@@ -163,5 +163,13 @@ module.exports = {
       }
     }
   },
-  commandsPath: './textCommands'
+  commandsPath: './textCommands',
+
+  internalApi: {
+    enabled: false,        // デフォルト無効。n=us デプロイ環境のみ有効化
+    port: 7890,
+    host: '127.0.0.1',     // Docker 環境では '0.0.0.0' に上書き
+    secretEnv: 'N_US_INTERNAL_API_SECRET',
+    webhookUrlEnv: 'N_US_WEBHOOK_URL'
+  }
 };

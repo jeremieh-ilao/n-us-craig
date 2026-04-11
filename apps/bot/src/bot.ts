@@ -170,9 +170,21 @@ export async function connect() {
   process.title = `${botName} - ${
     process.env.SHARD_ID ? `Shard #${process.env.SHARD_ID} (of ${process.env.SHARD_COUNT})` : `${client.bot.shards.size} shard(s)`
   }`;
+
+  const internalApiConfig = config.get('internalApi') as any;
+  if (internalApiConfig?.enabled) {
+    const { startInternalApi } = await import('./modules/internalApi');
+    const recorderModule = client.modules.get('recorder') as RecorderModule<any>;
+    await startInternalApi(recorderModule, internalApiConfig);
+  }
 }
 
 export async function disconnect() {
+  const internalApiConfig = config.get('internalApi') as any;
+  if (internalApiConfig?.enabled) {
+    const { stopInternalApi } = await import('./modules/internalApi');
+    await stopInternalApi();
+  }
   await client.disconnect();
   await closeSentry();
   await prisma.$disconnect();
