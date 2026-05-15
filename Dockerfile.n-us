@@ -1,0 +1,91 @@
+# n=us 用 production-ready Dockerfile
+# Craig upstream の dockerfile (install.sh + sleep 設計) ではなく、
+# 必要な apps/bot のみを multi-stage build する。
+
+# ============================================================
+# Builder stage: TypeScript ビルド + Prisma client 生成
+# ============================================================
+FROM node:20-bookworm AS builder
+
+# Native module ビルド用依存
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 make g++ gcc pkg-config \
+      libopus-dev libsodium-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# yarn workspaces のため、全 workspace の package.json が必要
+# tsconfig.json: apps/bot/tsconfig.json が `../../tsconfig.json` を extends するため、root も必要
+COPY package.json yarn.lock tsconfig.json ./
+COPY apps/bot/package.json ./apps/bot/
+COPY apps/tasks/package.json ./apps/tasks/
+COPY apps/dashboard/package.json ./apps/dashboard/
+COPY apps/download/package.json ./apps/download/
+
+# 全ワークスペース install (devDeps 含む)
+RUN yarn install --frozen-lockfile
+
+# Prisma client 生成 (schema を先に COPY)
+COPY prisma/ ./prisma/
+RUN npx prisma generate --schema=./prisma/schema.prisma
+
+# apps/bot のソースを COPY して build
+COPY apps/bot/ ./apps/bot/
+RUN yarn workspace craig-bot build
+
+# ============================================================
+# Runtime stage: 最小限の runtime 依存のみ
+# ============================================================
+FROM node:20-bookworm-slim AS runtime
+
+# 録音 runtime 依存 (HMAC API は .ogg raw stream のため cook 後処理ツール群は不要)
+# curl: healthcheck 用 (/internal/health に対する HTTP プローブ)
+# 注意: fdkaac は Debian bookworm 標準リポジトリに無いので除外
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg \
+      libopus0 libsodium23 \
+      ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Builder からの artifact を root 所有でコピー (権限後で調整)
+COPY --from=builder /app/package.json /app/yarn.lock ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/prisma ./prisma
+# locale/ は i18n が /app/locale から読み込む (craig 直下、ビルド context から直接)
+COPY locale ./locale
+# apps/bot は dist 以外にも emojis/, data/, config/, ecosystem.config.js が必要
+# (src/ も含まれるが小さいので簡素化のため一括 COPY)
+COPY --from=builder /app/apps/bot ./apps/bot
+
+# 録音保存ディレクトリ (Bind mount される /app/rec)
+RUN mkdir -p /app/rec
+
+# Entrypoint script
+# 1. _default.js を default.js にコピー (node-config が読むため)
+# 2. Prisma migration 適用 (DB 接続 ready 後)
+# 3. apps/bot を sharding 経由で起動
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -e' \
+    'echo "[entrypoint] Copy _default.js -> default.js"' \
+    'cp /app/apps/bot/config/_default.js /app/apps/bot/config/default.js' \
+    'echo "[entrypoint] Run Prisma migrations"' \
+    'npx prisma migrate deploy --schema=/app/prisma/schema.prisma' \
+    'echo "[entrypoint] Starting Craig bot (sharding)"' \
+    'cd /app/apps/bot' \
+    'exec node dist/sharding/index.js' \
+    > /entrypoint.sh \
+    && chmod +x /entrypoint.sh
+
+# 権限: node ユーザー (UID 1000, base image 提供)
+RUN chown -R node:node /app /entrypoint.sh
+
+USER node
+
+# Internal HMAC API
+EXPOSE 7890
+
+ENTRYPOINT ["/entrypoint.sh"]
