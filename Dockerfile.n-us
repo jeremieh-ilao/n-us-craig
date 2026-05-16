@@ -66,14 +66,16 @@ RUN mkdir -p /app/rec
 # Entrypoint script
 # 1. DATABASE_URL を POSTGRES_* env から構築 (二重管理回避 — POSTGRES_USER/PASSWORD/DB が
 #    postgres コンテナと craig-bot の単一信頼源、DATABASE_URL は派生値)
+#    パスワードに @ : / ? # % + & 等が含まれる可能性があるため node で URL エンコード
 # 2. _default.js を default.js にコピー (node-config が読むため)
 # 3. Prisma migration 適用 (DB 接続 ready 後)
 # 4. apps/bot を sharding 経由で起動
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -e' \
-    'export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB}"' \
-    'echo "[entrypoint] DATABASE_URL constructed from POSTGRES_* env (password redacted)"' \
+    'DATABASE_URL=$(node -e "const u=encodeURIComponent(process.env.POSTGRES_USER); const p=encodeURIComponent(process.env.POSTGRES_PASSWORD); const h=process.env.POSTGRES_HOST||\"postgres\"; const port=process.env.POSTGRES_PORT||\"5432\"; const db=encodeURIComponent(process.env.POSTGRES_DB); process.stdout.write(\`postgresql://\${u}:\${p}@\${h}:\${port}/\${db}\`)")' \
+    'export DATABASE_URL' \
+    'echo "[entrypoint] DATABASE_URL built (URL is not printed for security)"' \
     'echo "[entrypoint] Copy _default.js -> default.js"' \
     'cp /app/apps/bot/config/_default.js /app/apps/bot/config/default.js' \
     'echo "[entrypoint] Run Prisma migrations"' \
