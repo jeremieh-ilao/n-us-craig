@@ -1,13 +1,15 @@
 # n=us 用 production-ready Dockerfile
 # Craig upstream の dockerfile (install.sh + sleep 設計) ではなく、
 # 必要な apps/bot のみを multi-stage build する。
+# 加えて cook 後処理用の native binaries も同 image に同梱
+# (録音停止時に内部 API が cook.sh を spawn して単一 .ogg を生成)。
 
 # ============================================================
-# Builder stage: TypeScript ビルド + Prisma client 生成
+# Builder stage: TypeScript ビルド + Prisma client 生成 + cook C プログラム
 # ============================================================
 FROM node:20-bookworm AS builder
 
-# Native module ビルド用依存
+# Native module ビルド用依存 (yarn workspace) + cook C プログラムのコンパイラ
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 make g++ gcc pkg-config \
       libopus-dev libsodium-dev \
@@ -34,18 +36,37 @@ RUN npx prisma generate --schema=./prisma/schema.prisma
 COPY apps/bot/ ./apps/bot/
 RUN yarn workspace craig-bot build
 
+# Cook native プログラム (extnotes, oggcorrect, oggmultiplexer, oggstender, oggtracks,
+# oggduration, wavduration) を build。SVG → PNG (inkscape) はスキップ
+# — glower 機能は我々の用途で未使用、buildCook.sh は SVG 変換失敗で全体失敗するため
+# 手動 gcc loop で C ファイルだけビルド。
+COPY cook/ ./cook/
+RUN cd cook && for f in *.c; do gcc -O3 -o "${f%.c}" "$f"; done
+
+# cook.sh とその依存スクリプト
+COPY cook.sh ./cook.sh
+COPY scripts/ ./scripts/
+
 # ============================================================
-# Runtime stage: 最小限の runtime 依存のみ
+# Runtime stage: 最小限の runtime 依存 + cook 後処理ツール
 # ============================================================
 FROM node:20-bookworm-slim AS runtime
 
-# 録音 runtime 依存 (HMAC API は .ogg raw stream のため cook 後処理ツール群は不要)
-# curl: healthcheck 用 (/internal/health に対する HTTP プローブ)
-# 注意: fdkaac は Debian bookworm 標準リポジトリに無いので除外
+# Runtime 依存:
+#  - ffmpeg / libopus0 / libsodium23: 録音 (Discord voice → opus)
+#  - ca-certificates / curl: healthcheck + HTTPS
+#  - flac / opus-tools / vorbis-tools / lame: cook の出力エンコーダ
+#  - zip / unzip: cook が zip container を生成・展開する
+#  - at: cook.sh が tmpdir cleanup に使う (atd daemon は起動しないが at コマンド本体が必要)
+# 注意: fdkaac (AAC encoder) は Debian bookworm 標準リポジトリに無いので除外。
+# AAC 出力は使えないが、flac / opus / vorbis / mp3 / wav は利用可能。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
       libopus0 libsodium23 \
       ca-certificates curl \
+      flac opus-tools vorbis-tools lame \
+      zip unzip \
+      at \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -59,6 +80,10 @@ COPY locale ./locale
 # apps/bot は dist 以外にも emojis/, data/, config/, ecosystem.config.js が必要
 # (src/ も含まれるが小さいので簡素化のため一括 COPY)
 COPY --from=builder /app/apps/bot ./apps/bot
+# Cook artifact: native binaries + .sh helpers + cook.sh root + scripts/
+COPY --from=builder /app/cook ./cook
+COPY --from=builder /app/cook.sh ./cook.sh
+COPY --from=builder /app/scripts ./scripts
 
 # 録音保存ディレクトリ (Bind mount される /app/rec)
 RUN mkdir -p /app/rec
@@ -94,6 +119,7 @@ RUN printf '%s\n' \
     && chmod +x /entrypoint.sh
 
 # 権限: node ユーザー (UID 1000, base image 提供)
+# cook 系の native binaries 含めて node が読み・実行できるようにする
 RUN chown -R node:node /app /entrypoint.sh
 
 USER node

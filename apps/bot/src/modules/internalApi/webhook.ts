@@ -10,6 +10,10 @@ export async function sendWebhook(
     endedAt: string;
     durationMs: number;
     fileSize: number;
+    // cook 後処理が失敗した場合のエラーメッセージ (任意)。
+    // bot 側 webhook handler はこれが set されていたら upload を skip し
+    // session を "cook_failed" 状態として記録する想定。
+    cookError?: string;
   }
 ) {
   let attempts = 0;

@@ -1,4 +1,5 @@
 import fastify, { FastifyInstance } from 'fastify';
+import { spawn } from 'child_process';
 import Recording from '../recorder/recording';
 import RecorderModule from '../recorder';
 import { DEFAULT_REWARDS } from './rewards';
@@ -10,6 +11,110 @@ import fs from 'fs';
 const sessionToRecording = new Map<string, string>();
 
 let server: FastifyInstance | null = null;
+
+const COOK_SCRIPT_PATH = '/app/cook.sh';
+const COOK_FORMAT = process.env.COOK_FORMAT || 'flac';
+const COOK_CONTAINER = process.env.COOK_CONTAINER || 'mix';
+const COOK_TIMEOUT_MS = parseInt(process.env.COOK_TIMEOUT_MS || '600000', 10); // 10 min default
+
+/**
+ * cook.sh を起動し、録音 fragments を単一 .ogg にまとめて
+ * `<recordingPath>/<id>.cook.ogg` として保存する。
+ */
+async function runCook(
+  recordingId: string,
+  recorder: RecorderModule<any>
+): Promise<{ outputPath: string; size: number }> {
+  const outputPath = path.join(recorder.recordingPath, `${recordingId}.cook.ogg`);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+
+    const outStream = fs.createWriteStream(outputPath);
+    const proc = spawn(COOK_SCRIPT_PATH, [recordingId, COOK_FORMAT, COOK_CONTAINER], {
+      cwd: '/app',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+      }
+    });
+
+    let stderr = '';
+    proc.stdout?.pipe(outStream);
+    proc.stderr?.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    const killTimer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      settle(() => reject(new Error(`cook timeout after ${COOK_TIMEOUT_MS}ms: ${stderr.slice(-200)}`)));
+    }, COOK_TIMEOUT_MS);
+
+    proc.on('error', (err) => {
+      clearTimeout(killTimer);
+      settle(() => reject(new Error(`cook spawn failed: ${err.message}`)));
+    });
+
+    outStream.on('error', (err) => {
+      clearTimeout(killTimer);
+      proc.kill('SIGKILL');
+      settle(() => reject(new Error(`cook output stream failed: ${err.message}`)));
+    });
+
+    proc.on('close', (code) => {
+      clearTimeout(killTimer);
+      outStream.end(() => {
+        if (code !== 0) {
+          // exit 0 でなくても /tmp 残骸を残さないようファイル削除
+          try { fs.unlinkSync(outputPath); } catch {}
+          return settle(() => reject(new Error(`cook exited ${code}: ${stderr.slice(-500)}`)));
+        }
+
+        let stats: fs.Stats;
+        try {
+          stats = fs.statSync(outputPath);
+        } catch (e: any) {
+          return settle(() => reject(new Error(`cook output stat failed: ${e.message}`)));
+        }
+
+        if (stats.size === 0) {
+          try { fs.unlinkSync(outputPath); } catch {}
+          return settle(() => reject(new Error(`cook produced empty output: ${stderr.slice(-200)}`)));
+        }
+
+        // Ogg magic byte (OggS = 4F 67 67 53) を検証
+        // 空録音時に cook.sh が flac の usage を stdout に流す等の garbage を弾く
+        try {
+          const buf = Buffer.alloc(4);
+          const fd = fs.openSync(outputPath, 'r');
+          fs.readSync(fd, buf, 0, 4, 0);
+          fs.closeSync(fd);
+          const magic = buf.toString('ascii');
+          if (magic !== 'OggS') {
+            try { fs.unlinkSync(outputPath); } catch {}
+            return settle(() =>
+              reject(
+                new Error(
+                  `cook output is not a valid Ogg file (magic="${magic.replace(/[^\x20-\x7e]/g, '?')}", size=${stats.size}): ${stderr.slice(-200)}`
+                )
+              )
+            );
+          }
+        } catch (e: any) {
+          return settle(() => reject(new Error(`cook output magic check failed: ${e.message}`)));
+        }
+
+        settle(() => resolve({ outputPath, size: stats.size }));
+      });
+    });
+  });
+}
 
 export async function startInternalApi(recorder: RecorderModule<any>, config: any) {
   server = fastify({ logger: false });
@@ -80,7 +185,7 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
     instance.post<{ Body: { sessionId: string } }>('/internal/record/stop', async (request, reply) => {
       const { sessionId } = request.body;
       if (!sessionId) return reply.status(400).send({ error: 'Missing sessionId' });
-      
+
       const recordingId = sessionToRecording.get(sessionId);
       if (!recordingId) return reply.status(404).send({ error: 'Session not found' });
 
@@ -89,13 +194,20 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
 
       await recording.stop(true, 'n-us-internal');
 
-      const filePath = path.join(recorder.recordingPath, `${recording.id}.ogg`);
-      let fileSize = 0;
+      // Cook: combine raw fragments into a single playable .ogg
+      // Failure does not abort the stop response — bot side decides what to do via cookError.
+      let cookFileSize = 0;
+      let cookError: string | undefined;
       try {
-        if (fs.existsSync(filePath)) {
-          fileSize = fs.statSync(filePath).size;
-        }
-      } catch (e) {}
+        recorder.logger.info(`Cook starting for recording ${recording.id} (format=${COOK_FORMAT}, container=${COOK_CONTAINER})`);
+        const t0 = Date.now();
+        const cookResult = await runCook(recording.id, recorder);
+        cookFileSize = cookResult.size;
+        recorder.logger.info(`Cook complete for ${recording.id}: ${cookFileSize} bytes in ${Date.now() - t0}ms`);
+      } catch (err: any) {
+        cookError = err.message;
+        recorder.logger.error(`Cook failed for ${recording.id}: ${err.message}`);
+      }
 
       let webhookFailed = false;
       if (webhookUrl) {
@@ -105,7 +217,8 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
             recordingId: recording.id,
             endedAt: new Date().toISOString(),
             durationMs: recording.startedAt ? Date.now() - recording.startedAt.getTime() : 0,
-            fileSize
+            fileSize: cookFileSize,
+            cookError
           });
         } catch (err: any) {
           webhookFailed = true;
@@ -118,7 +231,9 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
         recordingId: recording.id,
         sessionId,
         endedAt: new Date().toISOString(),
-        filePath: `${recording.id}.ogg`,
+        filePath: `${recording.id}.cook.ogg`,
+        fileSize: cookFileSize,
+        cookError,
         webhookFailed
       };
     });
@@ -127,9 +242,18 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
       '/internal/record/:recordingId/file',
       async (request, reply) => {
         const { recordingId } = request.params;
-        const filePath = path.join(recorder.recordingPath, `${recordingId}.ogg`);
+        const cookedPath = path.join(recorder.recordingPath, `${recordingId}.cook.ogg`);
+        const rawPath = path.join(recorder.recordingPath, `${recordingId}.ogg`);
 
-        if (!fs.existsSync(filePath)) {
+        // cooked が優先、なければ legacy raw を fallback
+        let servePath: string | null = null;
+        if (fs.existsSync(cookedPath)) {
+          servePath = cookedPath;
+        } else if (fs.existsSync(rawPath)) {
+          servePath = rawPath;
+        }
+
+        if (!servePath) {
           return reply.status(404).send({ error: 'File not found' });
         }
 
@@ -137,7 +261,7 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
           reply.header('Content-Disposition', `attachment; filename="${recordingId}.ogg"`);
         }
 
-        const stream = fs.createReadStream(filePath);
+        const stream = fs.createReadStream(servePath);
         return reply.type('application/ogg').send(stream);
       }
     );
