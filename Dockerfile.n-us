@@ -64,6 +64,8 @@ COPY --from=builder /app/apps/bot ./apps/bot
 RUN mkdir -p /app/rec
 
 # Entrypoint script
+# 0. 必須 env 変数を validate (未設定で encodeURIComponent(undefined) → "undefined" が
+#    DATABASE_URL に混入してサイレントに認証エラーになる罠を回避)
 # 1. DATABASE_URL を POSTGRES_* env から構築 (二重管理回避 — POSTGRES_USER/PASSWORD/DB が
 #    postgres コンテナと craig-bot の単一信頼源、DATABASE_URL は派生値)
 #    パスワードに @ : / ? # % + & 等が含まれる可能性があるため node で URL エンコード
@@ -73,9 +75,14 @@ RUN mkdir -p /app/rec
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -e' \
+    ': "${POSTGRES_USER:?[entrypoint] FATAL: POSTGRES_USER must be set in .env.craig}"' \
+    ': "${POSTGRES_PASSWORD:?[entrypoint] FATAL: POSTGRES_PASSWORD must be set in .env.craig}"' \
+    ': "${POSTGRES_DB:?[entrypoint] FATAL: POSTGRES_DB must be set in .env.craig}"' \
+    ': "${CRAIG_BOT_TOKEN:?[entrypoint] FATAL: CRAIG_BOT_TOKEN must be set in .env.craig}"' \
+    ': "${N_US_INTERNAL_API_SECRET:?[entrypoint] FATAL: N_US_INTERNAL_API_SECRET must be set in .env.craig}"' \
     'DATABASE_URL=$(node -e "const u=encodeURIComponent(process.env.POSTGRES_USER); const p=encodeURIComponent(process.env.POSTGRES_PASSWORD); const h=process.env.POSTGRES_HOST||\"postgres\"; const port=process.env.POSTGRES_PORT||\"5432\"; const db=encodeURIComponent(process.env.POSTGRES_DB); process.stdout.write(\`postgresql://\${u}:\${p}@\${h}:\${port}/\${db}\`)")' \
     'export DATABASE_URL' \
-    'echo "[entrypoint] DATABASE_URL built (URL is not printed for security)"' \
+    'echo "[entrypoint] env validated, DATABASE_URL built (URL is not printed for security)"' \
     'echo "[entrypoint] Copy _default.js -> default.js"' \
     'cp /app/apps/bot/config/_default.js /app/apps/bot/config/default.js' \
     'echo "[entrypoint] Run Prisma migrations"' \
