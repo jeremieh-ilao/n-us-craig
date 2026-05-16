@@ -64,12 +64,16 @@ COPY --from=builder /app/apps/bot ./apps/bot
 RUN mkdir -p /app/rec
 
 # Entrypoint script
-# 1. _default.js を default.js にコピー (node-config が読むため)
-# 2. Prisma migration 適用 (DB 接続 ready 後)
-# 3. apps/bot を sharding 経由で起動
+# 1. DATABASE_URL を POSTGRES_* env から構築 (二重管理回避 — POSTGRES_USER/PASSWORD/DB が
+#    postgres コンテナと craig-bot の単一信頼源、DATABASE_URL は派生値)
+# 2. _default.js を default.js にコピー (node-config が読むため)
+# 3. Prisma migration 適用 (DB 接続 ready 後)
+# 4. apps/bot を sharding 経由で起動
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -e' \
+    'export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB}"' \
+    'echo "[entrypoint] DATABASE_URL constructed from POSTGRES_* env (password redacted)"' \
     'echo "[entrypoint] Copy _default.js -> default.js"' \
     'cp /app/apps/bot/config/_default.js /app/apps/bot/config/default.js' \
     'echo "[entrypoint] Run Prisma migrations"' \
