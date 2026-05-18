@@ -271,10 +271,16 @@ async function processCookAndWebhook(
     releaseCookSlot();
   }
 
-  let webhookSucceeded = false;
+  // bot 側 response の status を見て cleanup 判断する。
+  //   - 'ok'            : bot 側 upload 完了 → cleanup OK
+  //   - 'upload_failed' : bot 側で fetch / Firebase upload 失敗 → .cook.ogg を保持
+  //                        (bot 側 retry queue / 手動 recovery の元データとして残す)
+  //   - 'cook_failed'   : 呼び出し側は cookError != null なので下の `!cookError` でも弾かれる
+  //   - undefined       : webhook URL 未設定 / 例外で response 取得失敗 → 保守的に保持
+  let webhookResponseStatus: string | undefined;
   if (webhookUrl) {
     try {
-      await sendWebhook(webhookUrl, webhookSecret, {
+      const response = await sendWebhook(webhookUrl, webhookSecret, {
         sessionId,
         recordingId: recording.id,
         endedAt: new Date().toISOString(),
@@ -282,7 +288,7 @@ async function processCookAndWebhook(
         fileSize: cookFileSize,
         cookError
       });
-      webhookSucceeded = true;
+      webhookResponseStatus = response?.status;
     } catch (err: any) {
       // sendWebhook 内部で 3 回 retry してから throw する仕様。
       recorder.logger.error(
@@ -294,14 +300,18 @@ async function processCookAndWebhook(
     recorder.logger.warn?.(`No webhook URL configured; skipping notify for ${sessionId}`);
   }
 
-  // webhook が成功した場合のみ artifact cleanup。
-  // - cook 失敗時: raw fragments を残す (手動再 cook の余地)
-  // - webhook 失敗時: cook.ogg を残す (bot 側 fetch 経路が回復したら再送可能)
+  // artifact cleanup の発動条件:
+  //   - bot 側 response が status='ok' (= fetch + Firebase upload 完了確認済)
+  //   - かつ cook 自体も成功 (!cookError)
   //
-  // 注意: webhook 成功直後 (bot が fetch する前) に削除する race の理論的可能性あり。
-  // craig-bot ↔ n-us-bot は同一 docker network 内で ms 単位の通信のため実害は限定的。
-  // production スケールで顕在化したら遅延 cleanup or bot 側 ack API を導入する。
-  if (webhookSucceeded && !cookError) {
+  // 上記以外は raw fragments + .cook.ogg を保持し recovery 余地を残す:
+  //   - cook 失敗 → 手動再 cook の余地
+  //   - bot 側 upload_failed → bot 側 retry queue / 手動再 fetch の余地
+  //   - webhook network 不達 → bot 側回復後の再送余地
+  //
+  // 注意: bot 側 webhook handler は fetch → upload → Firestore 書き込みを同期 await した
+  // 後に 200 を返す設計なので、cleanup が bot fetch より先行する race は構造的に発生しない。
+  if (webhookResponseStatus === 'ok' && !cookError) {
     cleanupRecordingArtifacts(recorder.recordingPath, recording.id, recorder.logger);
   }
 }
