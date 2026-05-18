@@ -40,8 +40,10 @@ RUN yarn workspace craig-bot build
 # oggduration, wavduration) を build。SVG → PNG (inkscape) はスキップ
 # — glower 機能は我々の用途で未使用、buildCook.sh は SVG 変換失敗で全体失敗するため
 # 手動 gcc loop で C ファイルだけビルド。
+# `|| exit 1` で 1 ファイルでもコンパイル失敗したら image build 全体を fail させる。
+# (これが無いと壊れたバイナリで image build success → runtime で初めて発覚するリスク)
 COPY cook/ ./cook/
-RUN cd cook && for f in *.c; do gcc -O3 -o "${f%.c}" "$f"; done
+RUN cd cook && for f in *.c; do gcc -O3 -o "${f%.c}" "$f" || exit 1; done
 
 # cook.sh とその依存スクリプト
 COPY cook.sh ./cook.sh
@@ -57,16 +59,17 @@ FROM node:20-bookworm-slim AS runtime
 #  - ca-certificates / curl: healthcheck + HTTPS
 #  - flac / opus-tools / vorbis-tools / lame: cook の出力エンコーダ
 #  - zip / unzip: cook が zip container を生成・展開する
-#  - at: cook.sh が tmpdir cleanup に使う (atd daemon は起動しないが at コマンド本体が必要)
-# 注意: fdkaac (AAC encoder) は Debian bookworm 標準リポジトリに無いので除外。
-# AAC 出力は使えないが、flac / opus / vorbis / mp3 / wav は利用可能。
+# 注意 1: fdkaac (AAC encoder) は Debian bookworm 標準リポジトリに無いので除外。
+#         AAC 出力は使えないが、flac / opus / vorbis / mp3 / wav は利用可能。
+# 注意 2: 旧構成では `at` パッケージを入れて cook.sh の tmpdir cleanup に使っていたが、
+#         `atd` daemon を起動しない設計のため cleanup が永遠に走らない silent leak になっていた。
+#         cook.sh 側を `trap "rm -rf $tmpdir" EXIT` に変更し、`at` 依存を完全に除去した。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
       libopus0 libsodium23 \
       ca-certificates curl \
       flac opus-tools vorbis-tools lame \
       zip unzip \
-      at \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

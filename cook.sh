@@ -145,7 +145,11 @@ cd "$SCRIPTBASE/rec"
 tmpdir=`mktemp -d`
 [ "$tmpdir" -a -d "$tmpdir" ]
 
-echo 'rm -rf '"$tmpdir" | at 'now + 2 hours'
+# n-us-craig 変更: 元コードは `at 'now + 2 hours'` で遅延 cleanup を仕込んでいたが、
+# n-us 用イメージは atd daemon を起動しないため cleanup が永遠に走らない silent leak だった。
+# シェル exit (success / fail / kill 等) のタイミングで同期的に rm するように変更し、
+# `at` パッケージ依存を撤去した。
+trap 'rm -rf "$tmpdir"' EXIT
 
 OUTDIR="$tmpdir/out"
 mkdir "$OUTDIR" || exit 1

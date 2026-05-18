@@ -21,7 +21,92 @@ const COOK_SCRIPT_PATH = '/app/cook.sh';
 // 他の Ogg コンテナ形式 (opus, vorbis) も OggS で検証を通過する。
 const COOK_FORMAT = process.env.COOK_FORMAT || 'oggflac';
 const COOK_CONTAINER = process.env.COOK_CONTAINER || 'mix';
-const COOK_TIMEOUT_MS = parseInt(process.env.COOK_TIMEOUT_MS || '600000', 10); // 10 min default
+
+// COOK_TIMEOUT_MS は NaN / 0 / 負値を検出して default (10 min) に倒す。
+// parseInt('', 10) = NaN, parseInt('abc', 10) = NaN になり、そのまま
+// setTimeout(fn, NaN) すると即時実行で cook が起動した瞬間 SIGKILL される。
+const COOK_TIMEOUT_MS_DEFAULT = 600000; // 10 min
+function parseTimeoutMs(raw: string | undefined): number {
+  if (!raw) return COOK_TIMEOUT_MS_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : COOK_TIMEOUT_MS_DEFAULT;
+}
+const COOK_TIMEOUT_MS = parseTimeoutMs(process.env.COOK_TIMEOUT_MS);
+
+// stderr バッファ上限。cook が 10 分動作中に大量 stderr を出すと OOM につながる。
+// エラー解析には末尾の方が情報量が多いので、末尾を残す形で truncate する。
+const STDERR_MAX_BYTES = 65536; // 64KB
+
+// 並列 cook 制限。同時に複数セッションが終了すると複数 cook プロセスが
+// 同時 spawn されメモリ + CPU + ディスクを枯渇させる。簡易 semaphore で制限する。
+const MAX_CONCURRENT_COOKS = (() => {
+  const n = parseInt(process.env.MAX_CONCURRENT_COOKS || '2', 10);
+  return Number.isFinite(n) && n > 0 ? n : 2;
+})();
+let activeCooks = 0;
+const cookWaitQueue: (() => void)[] = [];
+
+function acquireCookSlot(): Promise<void> {
+  if (activeCooks < MAX_CONCURRENT_COOKS) {
+    activeCooks++;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    cookWaitQueue.push(() => {
+      activeCooks++;
+      resolve();
+    });
+  });
+}
+
+function releaseCookSlot(): void {
+  activeCooks--;
+  const next = cookWaitQueue.shift();
+  if (next) next();
+}
+
+// raw fragments + cook output の削除対象 (cook + webhook 完了後の cleanup 用)。
+// `.ogg.log.N` (ローテーション分) も対象に含めるため、ディレクトリスキャンで補完する。
+const RAW_FRAGMENT_SUFFIXES = [
+  '.ogg.data',
+  '.ogg.header1',
+  '.ogg.header2',
+  '.ogg.users',
+  '.ogg.info',
+  '.ogg.log',
+];
+
+function cleanupRecordingArtifacts(
+  recordingPath: string,
+  recordingId: string,
+  logger: { info: (msg: string) => void; warn?: (msg: string) => void }
+): void {
+  const targets = new Set<string>([
+    path.join(recordingPath, `${recordingId}.cook.ogg`),
+    ...RAW_FRAGMENT_SUFFIXES.map((s) => path.join(recordingPath, `${recordingId}${s}`))
+  ]);
+  // `.ogg.log.1`, `.ogg.log.2`, ... のローテーション分
+  try {
+    for (const entry of fs.readdirSync(recordingPath)) {
+      if (entry.startsWith(`${recordingId}.ogg.log.`)) {
+        targets.add(path.join(recordingPath, entry));
+      }
+    }
+  } catch {
+    // recordingPath が存在しない等のレアケース。次の unlink 試行でどうせ失敗するので無視。
+  }
+  let removed = 0;
+  // Set の iteration は tsconfig target に依存するため、Array.from 経由で確実に。
+  for (const t of Array.from(targets)) {
+    try {
+      fs.unlinkSync(t);
+      removed++;
+    } catch {
+      // 元々存在しない or 既に削除済 → 無視
+    }
+  }
+  logger.info(`Cleaned up ${removed} artifacts for recording ${recordingId}`);
+}
 
 /**
  * cook.sh を起動し、録音 fragments を単一 .ogg にまとめて
@@ -42,6 +127,14 @@ async function runCook(
     };
 
     const outStream = fs.createWriteStream(outputPath);
+
+    // エラーパス共通の cleanup: 出力 stream を閉じ、部分書き込みファイルを削除する。
+    // 旧実装は spawn error 時に outStream を閉じず FD leak していた。
+    const cleanupPartialOutput = () => {
+      try { outStream.destroy(); } catch {}
+      try { fs.unlinkSync(outputPath); } catch {}
+    };
+
     const proc = spawn(COOK_SCRIPT_PATH, [recordingId, COOK_FORMAT, COOK_CONTAINER], {
       cwd: '/app',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -53,23 +146,34 @@ async function runCook(
 
     let stderr = '';
     proc.stdout?.pipe(outStream);
-    proc.stderr?.on('data', (chunk) => {
-      stderr += chunk.toString();
+    proc.stderr?.on('data', (chunk: Buffer | string) => {
+      // 末尾を残す形で 64KB cap (cook が 10 分以上 stderr 出力した場合の OOM 防止)
+      const piece = chunk.toString();
+      if (stderr.length + piece.length > STDERR_MAX_BYTES) {
+        stderr = (stderr + piece).slice(-STDERR_MAX_BYTES);
+      } else {
+        stderr += piece;
+      }
     });
 
     const killTimer = setTimeout(() => {
       proc.kill('SIGKILL');
+      cleanupPartialOutput();
       settle(() => reject(new Error(`cook timeout after ${COOK_TIMEOUT_MS}ms: ${stderr.slice(-200)}`)));
     }, COOK_TIMEOUT_MS);
 
     proc.on('error', (err) => {
       clearTimeout(killTimer);
+      // FIX: spawn 失敗時に出力 stream を閉じ、部分書き込みファイルを削除する。
+      cleanupPartialOutput();
       settle(() => reject(new Error(`cook spawn failed: ${err.message}`)));
     });
 
     outStream.on('error', (err) => {
       clearTimeout(killTimer);
       proc.kill('SIGKILL');
+      // FIX: 出力 stream エラー時にも部分書き込みファイルを削除する。
+      try { fs.unlinkSync(outputPath); } catch {}
       settle(() => reject(new Error(`cook output stream failed: ${err.message}`)));
     });
 
@@ -125,6 +229,81 @@ async function runCook(
       });
     });
   });
+}
+
+/**
+ * /stop の同期処理から切り出した「cook 実行 → webhook 送信 → artifact cleanup」フロー。
+ *
+ * - cook 実行は concurrent 制限 (MAX_CONCURRENT_COOKS) で待機させる
+ * - cook が成功でも失敗でも webhook は送る (cookError があれば bot 側で
+ *   status="cook_failed" として記録する想定)
+ * - webhook が成功した場合のみ raw fragments + .cook.ogg を削除する
+ *   (失敗時は手動 recovery 用に残す)
+ *
+ * 例外は全て catch + log し、呼び出し側 (/stop) では fire-and-forget で使う。
+ */
+async function processCookAndWebhook(
+  recording: Recording,
+  sessionId: string,
+  webhookUrl: string,
+  webhookSecret: string,
+  recorder: RecorderModule<any>
+): Promise<void> {
+  await acquireCookSlot();
+
+  let cookFileSize = 0;
+  let cookError: string | undefined;
+
+  try {
+    recorder.logger.info(
+      `Cook starting for recording ${recording.id} (format=${COOK_FORMAT}, container=${COOK_CONTAINER})`
+    );
+    const t0 = Date.now();
+    const cookResult = await runCook(recording.id, recorder);
+    cookFileSize = cookResult.size;
+    recorder.logger.info(
+      `Cook complete for ${recording.id}: ${cookFileSize} bytes in ${Date.now() - t0}ms`
+    );
+  } catch (err: any) {
+    cookError = err?.message || String(err);
+    recorder.logger.error(`Cook failed for ${recording.id}: ${cookError}`);
+  } finally {
+    releaseCookSlot();
+  }
+
+  let webhookSucceeded = false;
+  if (webhookUrl) {
+    try {
+      await sendWebhook(webhookUrl, webhookSecret, {
+        sessionId,
+        recordingId: recording.id,
+        endedAt: new Date().toISOString(),
+        durationMs: recording.startedAt ? Date.now() - recording.startedAt.getTime() : 0,
+        fileSize: cookFileSize,
+        cookError
+      });
+      webhookSucceeded = true;
+    } catch (err: any) {
+      // sendWebhook 内部で 3 回 retry してから throw する仕様。
+      recorder.logger.error(
+        `Webhook failed for session ${sessionId} (after retries): ${err?.message || err}`
+      );
+    }
+  } else {
+    // webhook 未設定 (dev 環境想定) は upload 経路無いので artifact を残しておく
+    recorder.logger.warn?.(`No webhook URL configured; skipping notify for ${sessionId}`);
+  }
+
+  // webhook が成功した場合のみ artifact cleanup。
+  // - cook 失敗時: raw fragments を残す (手動再 cook の余地)
+  // - webhook 失敗時: cook.ogg を残す (bot 側 fetch 経路が回復したら再送可能)
+  //
+  // 注意: webhook 成功直後 (bot が fetch する前) に削除する race の理論的可能性あり。
+  // craig-bot ↔ n-us-bot は同一 docker network 内で ms 単位の通信のため実害は限定的。
+  // production スケールで顕在化したら遅延 cleanup or bot 側 ack API を導入する。
+  if (webhookSucceeded && !cookError) {
+    cleanupRecordingArtifacts(recorder.recordingPath, recording.id, recorder.logger);
+  }
 }
 
 export async function startInternalApi(recorder: RecorderModule<any>, config: any) {
@@ -204,48 +383,26 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
       if (!recording) return reply.status(404).send({ error: 'Recording not found' });
 
       await recording.stop(true, 'n-us-internal');
-
-      // Cook: combine raw fragments into a single playable .ogg
-      // Failure does not abort the stop response — bot side decides what to do via cookError.
-      let cookFileSize = 0;
-      let cookError: string | undefined;
-      try {
-        recorder.logger.info(`Cook starting for recording ${recording.id} (format=${COOK_FORMAT}, container=${COOK_CONTAINER})`);
-        const t0 = Date.now();
-        const cookResult = await runCook(recording.id, recorder);
-        cookFileSize = cookResult.size;
-        recorder.logger.info(`Cook complete for ${recording.id}: ${cookFileSize} bytes in ${Date.now() - t0}ms`);
-      } catch (err: any) {
-        cookError = err.message;
-        recorder.logger.error(`Cook failed for ${recording.id}: ${err.message}`);
-      }
-
-      let webhookFailed = false;
-      if (webhookUrl) {
-        try {
-          await sendWebhook(webhookUrl, secret, {
-            sessionId,
-            recordingId: recording.id,
-            endedAt: new Date().toISOString(),
-            durationMs: recording.startedAt ? Date.now() - recording.startedAt.getTime() : 0,
-            fileSize: cookFileSize,
-            cookError
-          });
-        } catch (err: any) {
-          webhookFailed = true;
-          recorder.logger.error(`Webhook failed for session ${sessionId}: ${err.message}`);
-        }
-      }
-
       sessionToRecording.delete(sessionId);
+
+      // Cook + webhook + cleanup はバックグラウンドで実行し、/stop は即時 return する。
+      // 旧実装は cook (最大 10 分) を await していたため fastify connection 占有 + bot 側
+      // タイムアウト連鎖のリスクがあった。結果は webhook 経由で bot に伝わる
+      // (cookError があれば session.recording.status="cook_failed"、無ければ upload 続行)。
+      //
+      // fire-and-forget だが processCookAndWebhook 内で全 error を catch + log するため
+      // unhandledRejection で bot プロセス全体が落ちることはない。
+      processCookAndWebhook(recording, sessionId, webhookUrl, secret, recorder).catch((err) => {
+        recorder.logger.error(
+          `Unexpected unhandled error in processCookAndWebhook for ${sessionId}: ${err?.message || err}`
+        );
+      });
+
       return {
         recordingId: recording.id,
         sessionId,
-        endedAt: new Date().toISOString(),
-        filePath: `${recording.id}.cook.ogg`,
-        fileSize: cookFileSize,
-        cookError,
-        webhookFailed
+        endedAt: new Date().toISOString()
+        // cook 結果は webhook で送られるため /stop response には含めない。
       };
     });
 
