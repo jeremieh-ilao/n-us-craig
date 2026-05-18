@@ -13,7 +13,13 @@ const sessionToRecording = new Map<string, string>();
 let server: FastifyInstance | null = null;
 
 const COOK_SCRIPT_PATH = '/app/cook.sh';
-const COOK_FORMAT = process.env.COOK_FORMAT || 'flac';
+// 'oggflac' は FLAC を Ogg コンテナに入れた形式 (OggS magic を持つ)。
+// 'flac' を使うと裸 FLAC (fLaC magic) が生成されるが、下の magic 検証が
+// OggS 固定で reject + 削除してしまう (n-us-craig の以前のバグ)。
+// その上 .cook.ogg 拡張子と中身 raw FLAC の食い違いで MIME type 不整合も起きるため、
+// 既定値を oggflac にして「拡張子・magic・MIME 全部 Ogg」で揃える。
+// 他の Ogg コンテナ形式 (opus, vorbis) も OggS で検証を通過する。
+const COOK_FORMAT = process.env.COOK_FORMAT || 'oggflac';
 const COOK_CONTAINER = process.env.COOK_CONTAINER || 'mix';
 const COOK_TIMEOUT_MS = parseInt(process.env.COOK_TIMEOUT_MS || '600000', 10); // 10 min default
 
@@ -88,8 +94,13 @@ async function runCook(
           return settle(() => reject(new Error(`cook produced empty output: ${stderr.slice(-200)}`)));
         }
 
-        // Ogg magic byte (OggS = 4F 67 67 53) を検証
-        // 空録音時に cook.sh が flac の usage を stdout に流す等の garbage を弾く
+        // Ogg magic byte (OggS = 4F 67 67 53) を検証する。
+        // 目的は 2 つ:
+        //   1. 空録音時に cook.sh が flac の usage を stdout に流す等の garbage を弾く
+        //   2. cook が無音圧縮の結果 0-byte 同然の出力を返した場合に検知
+        // 注意: COOK_FORMAT は oggflac / opus / vorbis 等の Ogg コンテナ系のみを許容する
+        //       前提。COOK_FORMAT=flac (裸 FLAC) は magic が fLaC なので reject される。
+        //       reviewer 指摘の通り、format ごとに magic を分岐する設計も将来検討。
         try {
           const buf = Buffer.alloc(4);
           const fd = fs.openSync(outputPath, 'r');
