@@ -1,10 +1,16 @@
 import fastify, { FastifyInstance } from 'fastify';
-import { spawn } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import Recording from '../recorder/recording';
 import RecorderModule from '../recorder';
 import { DEFAULT_REWARDS } from './rewards';
 import { checkInternalSecret } from './auth';
 import { sendWebhook } from './webhook';
+import {
+  assertValidRecordingId,
+  parseTimeoutMs,
+  maskId,
+  COOK_TIMEOUT_MS_DEFAULT
+} from './cookHelpers';
 import path from 'path';
 import fs from 'fs';
 
@@ -24,14 +30,7 @@ const COOK_SCRIPT_PATH = process.env.COOK_SCRIPT_PATH || '/app/cook.sh';
 //   - `--help` 等のフラグ風文字列 → cook.sh の引数パース脆弱性に依存しないよう shape を制限
 // craig 内部の recording.id は短い英数 (現状 [A-Za-z0-9]{12}) だが HMAC API 経由で間接的に
 // 渡るため defense in depth として正規表現で厳格化する。
-const RECORDING_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
-function assertValidRecordingId(id: unknown): asserts id is string {
-  if (typeof id !== 'string' || !RECORDING_ID_PATTERN.test(id)) {
-    // ログに混ぜても安全な形で再現可能な error message を作る。
-    const safe = typeof id === 'string' ? id.slice(0, 64).replace(/[^\x20-\x7e]/g, '?') : typeof id;
-    throw new Error(`Invalid recordingId (must match ${RECORDING_ID_PATTERN}): "${safe}"`);
-  }
-}
+// recordingId validation / maskId は cookHelpers.ts に切り出し済 (NR4-7 のテスト容易性のため)
 // 'oggflac' は FLAC を Ogg コンテナに入れた形式 (OggS magic を持つ)。
 // 'flac' を使うと裸 FLAC (fLaC magic) が生成されるが、下の magic 検証が
 // OggS 固定で reject + 削除してしまう (n-us-craig の以前のバグ)。
@@ -41,15 +40,7 @@ function assertValidRecordingId(id: unknown): asserts id is string {
 const COOK_FORMAT = process.env.COOK_FORMAT || 'oggflac';
 const COOK_CONTAINER = process.env.COOK_CONTAINER || 'mix';
 
-// COOK_TIMEOUT_MS は NaN / 0 / 負値を検出して default (10 min) に倒す。
-// parseInt('', 10) = NaN, parseInt('abc', 10) = NaN になり、そのまま
-// setTimeout(fn, NaN) すると即時実行で cook が起動した瞬間 SIGKILL される。
-const COOK_TIMEOUT_MS_DEFAULT = 600000; // 10 min
-function parseTimeoutMs(raw: string | undefined): number {
-  if (!raw) return COOK_TIMEOUT_MS_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : COOK_TIMEOUT_MS_DEFAULT;
-}
+// COOK_TIMEOUT_MS 等の env パースは cookHelpers.ts の純粋関数を使う (NR4-8 / NR4-7 対応)。
 const COOK_TIMEOUT_MS = parseTimeoutMs(process.env.COOK_TIMEOUT_MS);
 
 // stderr バッファ上限。cook が 10 分動作中に大量 stderr を出すと OOM につながる。
@@ -62,14 +53,21 @@ const STDERR_TAIL_FOR_ERROR = 500;
 
 // 並列 cook 制限。同時に複数セッションが終了すると複数 cook プロセスが
 // 同時 spawn されメモリ + CPU + ディスクを枯渇させる。簡易 semaphore で制限する。
-const MAX_CONCURRENT_COOKS = (() => {
-  const n = parseInt(process.env.MAX_CONCURRENT_COOKS || '2', 10);
+// MAX_CONCURRENT_COOKS は env から読み取り、parseTimeoutMs と同じく Number で typo に厳しく。
+// 直接 module load で評価され、override は process.env を介する形でのみ可能 (test では process.env を
+// 上書きしてから require する)。
+export const MAX_CONCURRENT_COOKS = (() => {
+  const raw = process.env.MAX_CONCURRENT_COOKS;
+  const n = raw === undefined ? 2 : Number(raw);
   return Number.isFinite(n) && n > 0 ? n : 2;
 })();
 let activeCooks = 0;
 const cookWaitQueue: (() => void)[] = [];
 
-function acquireCookSlot(): Promise<void> {
+// 簡易 semaphore: activeCooks < MAX_CONCURRENT_COOKS なら即時取得、
+// それ以外は queue に push して release 時に順次呼び出される。
+// FIFO 順序が保証され (Array.shift)、release 時の race 無し (Node.js single-thread)。
+export function acquireCookSlot(): Promise<void> {
   if (activeCooks < MAX_CONCURRENT_COOKS) {
     activeCooks++;
     return Promise.resolve();
@@ -82,10 +80,15 @@ function acquireCookSlot(): Promise<void> {
   });
 }
 
-function releaseCookSlot(): void {
+export function releaseCookSlot(): void {
   activeCooks--;
   const next = cookWaitQueue.shift();
   if (next) next();
+}
+
+// テスト用: semaphore の内部状態を観測 (本番フローからは呼ばない)
+export function _getCookSemaphoreState(): { active: number; queueLength: number } {
+  return { active: activeCooks, queueLength: cookWaitQueue.length };
 }
 
 // raw fragments + cook output の削除対象 (cook + webhook 完了後の cleanup 用)。
@@ -159,6 +162,14 @@ async function runCook(
 
     const outStream = fs.createWriteStream(outputPath);
 
+    // outStream.on('error') / killTimer / proc を outStream error handler から参照するが、
+    // ハンドラ登録時には未代入なので const ではなく let + 明示初期値 null を使う。
+    // 旧実装は `outStream.on('error', () => { proc?.kill?.(...); clearTimeout(killTimer) })` で
+    // 後段の const 宣言を参照しており「TDZ では?」と読み手を不安にさせていた (NR4-1)。
+    // runtime は process.nextTick 以降の callback 実行なので動作は正しいが、可読性のため整理。
+    let proc: ChildProcess | null = null;
+    let killTimer: NodeJS.Timeout | null = null;
+
     // エラーパス共通の cleanup: 出力 stream を閉じ、部分書き込みファイルを削除する。
     // 旧実装は spawn error 時に outStream を閉じず FD leak していた。
     const cleanupPartialOutput = () => {
@@ -170,14 +181,15 @@ async function runCook(
     // 失敗 (ENOENT 等) は process.nextTick で error event を発火するため、登録が後の方が
     // race window がほぼゼロでも理論上は逃す可能性がある。defense in depth で先に置く。
     outStream.on('error', (err) => {
-      clearTimeout(killTimer);
+      if (killTimer) clearTimeout(killTimer);
       // proc 未起動の場合 kill は no-op、後で起動した場合は kill して停止させる。
-      try { proc?.kill?.('SIGKILL'); } catch {}
+      // ChildProcess.kill は型上必ず存在するため二重 optional chain (`?.kill?.`) は冗長 (NR4-5)。
+      try { proc?.kill('SIGKILL'); } catch {}
       try { fs.unlinkSync(outputPath); } catch {}
       settle(() => reject(new Error(`cook output stream failed: ${err.message}`)));
     });
 
-    const proc = spawn(COOK_SCRIPT_PATH, [recordingId, COOK_FORMAT, COOK_CONTAINER], {
+    proc = spawn(COOK_SCRIPT_PATH, [recordingId, COOK_FORMAT, COOK_CONTAINER], {
       cwd: '/app',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
@@ -206,8 +218,8 @@ async function runCook(
       }
     });
 
-    const killTimer = setTimeout(() => {
-      proc.kill('SIGKILL');
+    killTimer = setTimeout(() => {
+      proc?.kill('SIGKILL');
       cleanupPartialOutput();
       settle(() =>
         reject(new Error(`cook timeout after ${COOK_TIMEOUT_MS}ms: ${stderr.slice(-STDERR_TAIL_FOR_ERROR)}`))
@@ -215,14 +227,14 @@ async function runCook(
     }, COOK_TIMEOUT_MS);
 
     proc.on('error', (err) => {
-      clearTimeout(killTimer);
+      if (killTimer) clearTimeout(killTimer);
       // FIX: spawn 失敗時に出力 stream を閉じ、部分書き込みファイルを削除する。
       cleanupPartialOutput();
       settle(() => reject(new Error(`cook spawn failed: ${err.message}`)));
     });
 
     proc.on('close', (code) => {
-      clearTimeout(killTimer);
+      if (killTimer) clearTimeout(killTimer);
       outStream.end(() => {
         if (code !== 0) {
           // exit 0 でなくても /tmp 残骸を残さないようファイル削除
@@ -309,15 +321,25 @@ async function processCookAndWebhook(
   // - 並列 cook 数を log で見える化することで semaphore 飽和や cook stall を運用で検知しやすくする
   // - shutdown 戦略は別途 (TODO): SIGTERM 受信時に残存 promise を `Promise.allSettled` で待つ
   //   グレースフルストップは現状未実装。production 投入前に必要なら追加する
+  //
+  // NR4-2: 並列 cook が稀な前提なので、queue 待機が発生したときだけ wait/acquired ログを出す。
+  //        毎回 cook で 2 行ずつ info ログが流れて spam になるのを抑止。
+  // NR4-4: sessionId / recordingId は maskId で末尾 4 文字のみ表示する。完全平文だと
+  //        log retention policy 観点で扱いが煩雑になるため。debug 困難になるほどではない長さ。
+  const willWait = activeCooks >= MAX_CONCURRENT_COOKS;
   const waitStart = Date.now();
-  recorder.logger.info(
-    `Cook slot wait: active=${activeCooks}/${MAX_CONCURRENT_COOKS}, queue=${cookWaitQueue.length}, sessionId=${sessionId}`
-  );
+  if (willWait) {
+    recorder.logger.info(
+      `Cook slot wait: active=${activeCooks}/${MAX_CONCURRENT_COOKS}, queue=${cookWaitQueue.length}, sessionId=${maskId(sessionId)}`
+    );
+  }
   await acquireCookSlot();
   const waitedMs = Date.now() - waitStart;
-  recorder.logger.info(
-    `Cook slot acquired: active=${activeCooks}/${MAX_CONCURRENT_COOKS}, waited=${waitedMs}ms, sessionId=${sessionId}`
-  );
+  if (waitedMs > 0) {
+    recorder.logger.info(
+      `Cook slot acquired after wait: active=${activeCooks}/${MAX_CONCURRENT_COOKS}, waited=${waitedMs}ms, sessionId=${maskId(sessionId)}`
+    );
+  }
 
   let cookFileSize = 0;
   let cookError: string | undefined;
@@ -491,9 +513,13 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
 
         // 外部から URL 経由で渡る値なので path traversal / 空文字を validate する。
         // `path.join(recorder.recordingPath, '../foo.cook.ogg')` は親ディレクトリ参照に化けるリスク。
+        // NR4-3: error message を log に残して「誰が不正な ID を投げてきたか」debug 可能にする。
+        // log 経由で攻撃検知することは主目的ではない (Discord bot / n-us-bot 経由のみ到達) が、
+        // 設定ミスや内部 bug 由来の不正値を発見する手がかりが消えないように warn を残す。
         try {
           assertValidRecordingId(recordingId);
-        } catch {
+        } catch (err: any) {
+          recorder.logger.warn?.(`[/file] Invalid recordingId: ${err?.message || err}`);
           return reply.status(400).send({ error: 'Invalid recordingId format' });
         }
 
