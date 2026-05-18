@@ -430,7 +430,11 @@ export async function startInternalApi(recorder: RecorderModule<any>, config: an
         }
 
         const stream = fs.createReadStream(servePath);
-        return reply.type('application/ogg').send(stream);
+        // MIME は audio/ogg を使う (RFC 5334)。一部 player は application/ogg だと
+        // video コンテンツと誤判定して再生失敗するため、Ogg コンテナの音声は
+        // 明示的に audio/ogg を返す。cook の出力は oggflac / opus / vorbis 等の
+        // Ogg コンテナ系のみを許容するため (magic 検証で OggS 固定)、固定値で問題ない。
+        return reply.type('audio/ogg').send(stream);
       }
     );
   });

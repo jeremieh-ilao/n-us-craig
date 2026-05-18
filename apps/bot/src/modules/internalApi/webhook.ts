@@ -18,7 +18,11 @@ export async function sendWebhook(
 ) {
   let attempts = 0;
   const maxAttempts = 3;
-  const timeout = 10000;
+  // n-us-bot 側の webhook handler は fetchRecordingFile + Firebase Storage upload を
+  // 同期的に await する。録音時間が長く .cook.ogg が大きいと upload に数十秒かかる
+  // ケースがあり、旧 timeout=10s では bot 応答前に craig 側で retry が走って
+  // 二重 status update を起こすリスクがあった。60s に拡張する。
+  const timeout = 60000;
 
   while (attempts < maxAttempts) {
     try {
