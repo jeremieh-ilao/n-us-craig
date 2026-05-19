@@ -1,0 +1,46 @@
+name: Unit Tests
+
+# n-us 用に追加した cook 統合まわりの純粋関数 / semaphore の unit test を走らせる。
+# upstream Yahweasel/Craig の test ではなく、n-us-craig fork 独自の test。
+#
+# 対象: apps/bot/src/modules/internalApi/__tests__/*.test.ts
+#   - cookHelpers.test.ts (16 test: assertValidRecordingId / parseTimeoutMs / maskId)
+#   - cookSemaphore.test.ts (10 test: acquireCookSlot / releaseCookSlot / FIFO 等)
+#
+# 軽量化: craig 全体の yarn install (@discordjs/opus / sodium-native のネイティブビルド) は
+# 重いため、対象 test ファイルが副作用ゼロ (他 module を import しない) ことを利用して
+# vitest のみ on-demand install で走らせる。
+
+on:
+  pull_request:
+    branches:
+      - main
+      - feature/cook-integration
+  push:
+    branches:
+      - main
+      - feature/cook-integration
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install vitest (no full workspace install)
+        working-directory: apps/bot
+        # craig 全体の yarn install は @discordjs/opus / sodium-native 等のネイティブビルド
+        # を含み重い。cookHelpers / cookSemaphore は副作用ゼロで他 module を import しない
+        # ため、vitest + typescript だけ on-demand install して動かす。
+        # --no-save / --no-package-lock で package.json / lock を汚さない。
+        run: npm install --no-save --no-package-lock vitest@3.0.7 typescript@5.8.3
+
+      - name: Run unit tests
+        working-directory: apps/bot
+        run: npx vitest run
