@@ -24,7 +24,7 @@ on:
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -33,14 +33,31 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install vitest (no full workspace install)
-        working-directory: apps/bot
-        # craig 全体の yarn install は @discordjs/opus / sodium-native 等のネイティブビルド
-        # を含み重い。cookHelpers / cookSemaphore は副作用ゼロで他 module を import しない
-        # ため、vitest + typescript だけ on-demand install して動かす。
-        # --no-save / --no-package-lock で package.json / lock を汚さない。
-        run: npm install --no-save --no-package-lock vitest@3.0.7 typescript@5.8.3
+      # craig は yarn workspaces で、apps/dashboard の preact-compat (preact <10 を要求) と
+      # root の preact ^10.9.0 が peer conflict を起こすため、npm では install 不可。
+      # yarn を使い、craig が想定する依存解決経路に乗せる。
+      # native deps (libopus-dev / libsodium-dev) は @discordjs/opus / sodium-native の
+      # ビルドに必要 (Dockerfile.n-us の builder stage と同じ依存)。
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 make g++ gcc pkg-config libopus-dev libsodium-dev
 
-      - name: Run unit tests
+      - name: Cache yarn deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: yarn-${{ runner.os }}-
+
+      - name: Install dependencies (yarn workspaces)
+        # --frozen-lockfile で lock 不整合検知、--ignore-scripts は使わない
+        # (sodium-native / @discordjs/opus のビルドが必要なため)
+        run: yarn install --frozen-lockfile
+
+      - name: Run unit tests (cookHelpers / cookSemaphore)
         working-directory: apps/bot
-        run: npx vitest run
+        run: yarn test
