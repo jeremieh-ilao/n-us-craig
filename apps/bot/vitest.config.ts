@@ -14,6 +14,11 @@ export default defineConfig({
     testTimeout: 10000,
     hookTimeout: 10000,
     pool: 'forks',
+    // NR5-6: singleFork の理由を明示。
+    // - `cookSemaphore.ts` は module-scope の mutable state (activeCooks / cookWaitQueue) を持つ
+    //   ため、test ファイル間 / test 間で state leak しないように単一プロセスで直列実行する
+    // - 各 test の beforeEach で `_resetCookSemaphore()` を呼んで内部 state を初期化することと併用
+    // - 副作用ゼロの `cookHelpers.ts` test だけなら並列で問題ないが、混在運用のため安全側に倒している
     poolOptions: {
       forks: {
         singleFork: true

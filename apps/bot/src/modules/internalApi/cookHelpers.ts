@@ -52,11 +52,19 @@ export function parseTimeoutMs(raw: string | undefined): number {
  * log retention policy / GDPR 観点で扱いが煩雑になる ため間を取る (NR4-4)。
  * error log (Cook failed 等の異常系) はフル ID のままで debug 性を優先する。
  *
+ * NR5-5: 短い ID で mask 率が下がる罠を回避するため、**ID が 8 文字未満は全 mask** にする。
+ * - 5 文字 ID で `...bcde` のように 80% が平文だと意味が薄い
+ * - 8 文字以上は末尾 4 文字残し (mask 率 50% 以上を保証)
+ * - craig の実 `recording.id` は 12 文字固定なので運用上 `...xyz9` 形式が常に使われる
+ *
  * 注意: 既存 craig log と完全に揃ってはいない。craig 全体の log policy 整備は
  * 別 PR で実施する想定。
  */
+export const MASK_ID_MIN_LENGTH_FOR_SUFFIX = 8;
+
 export function maskId(id: string): string {
   if (typeof id !== 'string' || id.length === 0) return '<empty>';
-  if (id.length <= 4) return '*'.repeat(id.length);
+  // 8 文字未満は短すぎて末尾露出だと mask 率が低くなりすぎる → 全 mask
+  if (id.length < MASK_ID_MIN_LENGTH_FOR_SUFFIX) return '*'.repeat(id.length);
   return `...${id.slice(-4)}`;
 }

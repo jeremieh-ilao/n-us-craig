@@ -11,6 +11,7 @@ import {
   maskId,
   COOK_TIMEOUT_MS_DEFAULT
 } from './cookHelpers';
+import { acquireCookSlot, releaseCookSlot, _getCookSemaphoreState } from './cookSemaphore';
 import path from 'path';
 import fs from 'fs';
 
@@ -54,42 +55,14 @@ const STDERR_TAIL_FOR_ERROR = 500;
 // 並列 cook 制限。同時に複数セッションが終了すると複数 cook プロセスが
 // 同時 spawn されメモリ + CPU + ディスクを枯渇させる。簡易 semaphore で制限する。
 // MAX_CONCURRENT_COOKS は env から読み取り、parseTimeoutMs と同じく Number で typo に厳しく。
-// 直接 module load で評価され、override は process.env を介する形でのみ可能 (test では process.env を
-// 上書きしてから require する)。
-export const MAX_CONCURRENT_COOKS = (() => {
+// 直接 module load で評価され、override は process.env を介する形でのみ可能。
+const MAX_CONCURRENT_COOKS = (() => {
   const raw = process.env.MAX_CONCURRENT_COOKS;
   const n = raw === undefined ? 2 : Number(raw);
   return Number.isFinite(n) && n > 0 ? n : 2;
 })();
-let activeCooks = 0;
-const cookWaitQueue: (() => void)[] = [];
 
-// 簡易 semaphore: activeCooks < MAX_CONCURRENT_COOKS なら即時取得、
-// それ以外は queue に push して release 時に順次呼び出される。
-// FIFO 順序が保証され (Array.shift)、release 時の race 無し (Node.js single-thread)。
-export function acquireCookSlot(): Promise<void> {
-  if (activeCooks < MAX_CONCURRENT_COOKS) {
-    activeCooks++;
-    return Promise.resolve();
-  }
-  return new Promise<void>((resolve) => {
-    cookWaitQueue.push(() => {
-      activeCooks++;
-      resolve();
-    });
-  });
-}
-
-export function releaseCookSlot(): void {
-  activeCooks--;
-  const next = cookWaitQueue.shift();
-  if (next) next();
-}
-
-// テスト用: semaphore の内部状態を観測 (本番フローからは呼ばない)
-export function _getCookSemaphoreState(): { active: number; queueLength: number } {
-  return { active: activeCooks, queueLength: cookWaitQueue.length };
-}
+// semaphore 本体は cookSemaphore.ts に切り出し済 (NR5-2 unit test 容易性のため)。
 
 // raw fragments + cook output の削除対象 (cook + webhook 完了後の cleanup 用)。
 // `.ogg.log.N` (ローテーション分) も対象に含めるため、ディレクトリスキャンで補完する。
@@ -326,18 +299,22 @@ async function processCookAndWebhook(
   //        毎回 cook で 2 行ずつ info ログが流れて spam になるのを抑止。
   // NR4-4: sessionId / recordingId は maskId で末尾 4 文字のみ表示する。完全平文だと
   //        log retention policy 観点で扱いが煩雑になるため。debug 困難になるほどではない長さ。
-  const willWait = activeCooks >= MAX_CONCURRENT_COOKS;
+  // semaphore の現在 state を取得 (in-flight 数の可視化)。
+  // cookSemaphore.ts に切り出した実装を経由するため、活動カウンタへの直接 access は廃止。
+  const stateBefore = _getCookSemaphoreState();
+  const willWait = stateBefore.active >= MAX_CONCURRENT_COOKS;
   const waitStart = Date.now();
   if (willWait) {
     recorder.logger.info(
-      `Cook slot wait: active=${activeCooks}/${MAX_CONCURRENT_COOKS}, queue=${cookWaitQueue.length}, sessionId=${maskId(sessionId)}`
+      `Cook slot wait: active=${stateBefore.active}/${MAX_CONCURRENT_COOKS}, queue=${stateBefore.queueLength}, sessionId=${maskId(sessionId)}`
     );
   }
-  await acquireCookSlot();
+  await acquireCookSlot(MAX_CONCURRENT_COOKS);
   const waitedMs = Date.now() - waitStart;
   if (waitedMs > 0) {
+    const stateAfter = _getCookSemaphoreState();
     recorder.logger.info(
-      `Cook slot acquired after wait: active=${activeCooks}/${MAX_CONCURRENT_COOKS}, waited=${waitedMs}ms, sessionId=${maskId(sessionId)}`
+      `Cook slot acquired after wait: active=${stateAfter.active}/${MAX_CONCURRENT_COOKS}, waited=${waitedMs}ms, sessionId=${maskId(sessionId)}`
     );
   }
 

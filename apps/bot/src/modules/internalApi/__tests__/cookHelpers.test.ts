@@ -109,15 +109,21 @@ describe('parseTimeoutMs', () => {
   });
 });
 
-describe('maskId (NR4-4 sensitive log policy)', () => {
-  it('末尾 4 文字を残してマスク', () => {
-    expect(maskId('mRrCzyVpf1Xu')).toBe('...f1Xu');
-    expect(maskId('abcdefghij')).toBe('...ghij');
+describe('maskId (NR4-4 sensitive log policy + NR5-5 短 ID 強化)', () => {
+  it('8 文字以上は末尾 4 文字を残してマスク', () => {
+    expect(maskId('mRrCzyVpf1Xu')).toBe('...f1Xu'); // 12 文字 (craig 実 ID)
+    expect(maskId('abcdefghij')).toBe('...ghij'); // 10 文字
+    expect(maskId('abcdefgh')).toBe('...efgh'); // 8 文字 (境界値)
   });
 
-  it('4 文字以下は全マスク', () => {
+  it('NR5-5: 8 文字未満 (短 ID) は全マスクで mask 率を担保', () => {
+    // 旧実装は 5 文字 'abcde' → '...bcde' (80% 平文) で mask の意味が薄かった。
+    // 8 文字未満は全 mask に倒すことで mask 率を 100% にする。
     expect(maskId('a')).toBe('*');
+    expect(maskId('ab')).toBe('**');
     expect(maskId('abcd')).toBe('****');
+    expect(maskId('abcde')).toBe('*****'); // 5 文字 — NR5-5 で改善された境界
+    expect(maskId('abcdefg')).toBe('*******'); // 7 文字 — まだ境界内
   });
 
   it('空文字 / 非文字列は <empty>', () => {
