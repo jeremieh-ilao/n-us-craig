@@ -3,9 +3,15 @@
   "compilerOptions": {
     "outDir": "dist",
     "sourceMap": true,
-    "inlineSources": true
+    "inlineSources": true,
+    "skipLibCheck": true
   },
   "include": [
     "./src/**/*"
+  ],
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/**/__tests__/**",
+    "vitest.config.ts"
   ]
 }
