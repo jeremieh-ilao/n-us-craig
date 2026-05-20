@@ -1,0 +1,63 @@
+name: Unit Tests
+
+# n-us 用に追加した cook 統合まわりの純粋関数 / semaphore の unit test を走らせる。
+# upstream Yahweasel/Craig の test ではなく、n-us-craig fork 独自の test。
+#
+# 対象: apps/bot/src/modules/internalApi/__tests__/*.test.ts
+#   - cookHelpers.test.ts (16 test: assertValidRecordingId / parseTimeoutMs / maskId)
+#   - cookSemaphore.test.ts (10 test: acquireCookSlot / releaseCookSlot / FIFO 等)
+#
+# 軽量化: craig 全体の yarn install (@discordjs/opus / sodium-native のネイティブビルド) は
+# 重いため、対象 test ファイルが副作用ゼロ (他 module を import しない) ことを利用して
+# vitest のみ on-demand install で走らせる。
+
+on:
+  pull_request:
+    branches:
+      - main
+      - feature/cook-integration
+  push:
+    branches:
+      - main
+      - feature/cook-integration
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # craig は yarn workspaces で、apps/dashboard の preact-compat (preact <10 を要求) と
+      # root の preact ^10.9.0 が peer conflict を起こすため、npm では install 不可。
+      # yarn を使い、craig が想定する依存解決経路に乗せる。
+      # native deps (libopus-dev / libsodium-dev) は @discordjs/opus / sodium-native の
+      # ビルドに必要 (Dockerfile.n-us の builder stage と同じ依存)。
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 make g++ gcc pkg-config libopus-dev libsodium-dev
+
+      - name: Cache yarn deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: yarn-${{ runner.os }}-
+
+      - name: Install dependencies (yarn workspaces)
+        # --frozen-lockfile で lock 不整合検知、--ignore-scripts は使わない
+        # (sodium-native / @discordjs/opus のビルドが必要なため)
+        run: yarn install --frozen-lockfile
+
+      - name: Run unit tests (cookHelpers / cookSemaphore)
+        working-directory: apps/bot
+        run: yarn test
